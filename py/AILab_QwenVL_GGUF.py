@@ -275,6 +275,11 @@ class QwenVLGGUFBase:
         author_dir = safe_dirname(resolved.author or "")
         repo_dir = safe_dirname(resolved.repo_dirname)
         target_dir = base_dir / author_dir / repo_dir
+        # ---- [本地化补丁 1/2] 兼容"平铺存放" ----
+        # 原逻辑假设目录结构为 base_dir/<author>/<repo_name>/，平铺存放时该目录不存在，
+        # 会让后续所有查找从"不存在的目录"出发，最终触发无谓的 HF 下载。此处回退到 base_dir。
+        if not target_dir.exists():
+            target_dir = base_dir
 
         existing_model = find_local_gguf_file(resolved.model_filename, target_dir)
         if existing_model:
@@ -282,9 +287,39 @@ class QwenVLGGUFBase:
         else:
             model_path = target_dir / Path(resolved.model_filename).name
 
-        existing_mmproj = find_local_gguf_file(resolved.mmproj_filename, target_dir, allow_recursive=False)
+        # ---- [本地化补丁 2/2] 多目录模糊查找 mmproj，避免无谓下载 ----
+        # 原逻辑：allow_recursive=False，且文件名按清单精确匹配（如 mmproj-...-F16.gguf）。
+        # 当本地只有别的量化档（如 -Q8_0.gguf）或文件放在 base_dir 的上一级时，会判定"没有"并去 HF 下载。
+        # 此处改为：在 target_dir / base_dir / base_dir.parent 里按 *mmproj*.gguf 模糊找，
+        # 并优先选与主模型量化档一致的（q8 对 q8），其次 f16/bf16，最后取第一个。
+        def _local_mmproj_find(_dirs, _model_filename):
+            _stem = Path(_model_filename).stem.lower()
+            for _d in _dirs:
+                try:
+                    if _d is None or not _d.exists():
+                        continue
+                    _cands = list(_d.glob("*mmproj*.gguf"))
+                    if not _cands:
+                        continue
+                    _pick = None
+                    for _c in _cands:
+                        _n = _c.name.lower()
+                        if "q8" in _stem and "q8" in _n:
+                            return _c
+                        if ("f16" in _n or "bf16" in _n) and _pick is None:
+                            _pick = _c
+                    return _pick or _cands[0]
+                except Exception:
+                    pass
+            return None
+
+        existing_mmproj = _local_mmproj_find(
+            [target_dir, base_dir, base_dir.parent], resolved.model_filename
+        ) or find_local_gguf_file(resolved.mmproj_filename, target_dir, allow_recursive=True)
+        # ---- [本地化补丁 2/2 结束] ----
         if existing_mmproj:
             mmproj_path = existing_mmproj
+            print(f"[QwenVL] Local visual projector found: {mmproj_path.name}")
         else:
             mmproj_path = target_dir / Path(resolved.mmproj_filename).name if resolved.mmproj_filename else None
 
